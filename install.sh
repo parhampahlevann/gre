@@ -16,8 +16,11 @@ WG_IFACE="wg-vatan"
 WG_CONF="/etc/wireguard/${WG_IFACE}.conf"
 UDP2RAW_BIN="/usr/local/bin/udp2raw"
 UDP2RAW_SERVICE="/etc/systemd/system/udp2raw-vatan.service"
-UDP2RAW_PORT=4096      # raw obfuscated port (TCP-looking)
-WG_LISTEN_PORT=51820   # real WireGuard UDP port (kept local, only udp2raw is exposed)
+UDP2RAW_PORT=4096         # raw obfuscated port (TCP-looking), exposed publicly on FOREIGN
+WG_LISTEN_PORT=51820      # real WireGuard UDP port (each side's own local socket)
+WG_UDP2RAW_LOCAL_PORT=51821  # separate local port the IRAN-side udp2raw client binds to
+                              # (must differ from WG_LISTEN_PORT or udp2raw fails with
+                              # "socket bind error" since WireGuard already owns that port)
 
 PORT_STATE_DIR="/etc/vatan-tunnel"
 PORT_STATE_FILE="${PORT_STATE_DIR}/ports.conf"
@@ -594,7 +597,6 @@ if [[ "$MAIN_CHOICE" == "2" ]]; then
 
     if [[ "$LOCATION" == "1" ]]; then
         WG_LOCAL_TUNNEL_IP="10.20.30.2/30"
-        WG_PEER_ENDPOINT="127.0.0.1:${WG_LISTEN_PORT}"  # udp2raw forwards locally
         ROLE="client"   # IRAN side connects out through udp2raw client -> FOREIGN
     else
         WG_LOCAL_TUNNEL_IP="10.20.30.1/30"
@@ -635,7 +637,11 @@ if [[ "$MAIN_CHOICE" == "2" ]]; then
     fi
 
     sudo mkdir -p /etc/wireguard
-    sudo bash -c "cat > $WG_CONF" <<EOF
+    if [[ "$ROLE" == "client" ]]; then
+        # IRAN: WireGuard must send its traffic to udp2raw's OWN local relay port,
+        # which is DIFFERENT from WireGuard's own ListenPort (they can't share a
+        # port — that's what caused "socket bind error" before).
+        sudo bash -c "cat > $WG_CONF" <<EOF
 [Interface]
 PrivateKey = $PRIVKEY
 Address = $WG_LOCAL_TUNNEL_IP
@@ -645,9 +651,26 @@ MTU = 1380
 [Peer]
 PublicKey = $PEER_PUBKEY
 AllowedIPs = 10.20.30.0/30
-Endpoint = 127.0.0.1:$WG_LISTEN_PORT
+Endpoint = 127.0.0.1:$WG_UDP2RAW_LOCAL_PORT
 PersistentKeepalive = 15
 EOF
+    else
+        # FOREIGN: no static Endpoint — it just waits and learns the peer's
+        # address dynamically from the first packet udp2raw relays to it
+        # locally. Setting one here would just point WireGuard at itself.
+        sudo bash -c "cat > $WG_CONF" <<EOF
+[Interface]
+PrivateKey = $PRIVKEY
+Address = $WG_LOCAL_TUNNEL_IP
+ListenPort = $WG_LISTEN_PORT
+MTU = 1380
+
+[Peer]
+PublicKey = $PEER_PUBKEY
+AllowedIPs = 10.20.30.0/30
+PersistentKeepalive = 15
+EOF
+    fi
 
     sudo systemctl enable wg-quick@"$WG_IFACE" 2>/dev/null || true
     sudo wg-quick up "$WG_IFACE" || sudo systemctl restart wg-quick@"$WG_IFACE"
@@ -675,7 +698,7 @@ Description=udp2raw client (vatan tunnel)
 After=network.target
 
 [Service]
-ExecStart=$UDP2RAW_BIN -c -l127.0.0.1:${WG_LISTEN_PORT} -r${IP_FOREIGN}:${UDP2RAW_PORT} -k "$RAW_PASS" --raw-mode faketcp -a
+ExecStart=$UDP2RAW_BIN -c -l127.0.0.1:${WG_UDP2RAW_LOCAL_PORT} -r${IP_FOREIGN}:${UDP2RAW_PORT} -k "$RAW_PASS" --raw-mode faketcp -a
 Restart=always
 RestartSec=3
 
