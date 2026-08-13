@@ -575,6 +575,21 @@ if [[ "$MAIN_CHOICE" == "2" ]]; then
         safe_apt_install wireguard wireguard-tools
     fi
 
+    echo -e "${YELLOW}[*] Tuning kernel network buffers for higher throughput...${RESET}"
+    if ! grep -q "vatan-tunnel buffer tuning" /etc/sysctl.conf 2>/dev/null; then
+        sudo bash -c "cat >> /etc/sysctl.conf" <<'EOF'
+
+# >>> vatan-tunnel buffer tuning
+net.core.rmem_max=16777216
+net.core.wmem_max=16777216
+net.core.rmem_default=4194304
+net.core.wmem_default=4194304
+net.ipv4.udp_mem=1000000 2000000 4000000
+# <<< vatan-tunnel buffer tuning
+EOF
+        sudo sysctl -p >/dev/null 2>&1 || true
+    fi
+
     if ! command -v "$UDP2RAW_BIN" >/dev/null 2>&1 && [[ ! -f "$UDP2RAW_BIN" ]]; then
         echo -e "${YELLOW}[*] Downloading udp2raw...${RESET}"
         cd /tmp
@@ -660,7 +675,7 @@ if [[ "$MAIN_CHOICE" == "2" ]]; then
 PrivateKey = $PRIVKEY
 Address = $WG_LOCAL_TUNNEL_IP
 ListenPort = $WG_LISTEN_PORT
-MTU = 1380
+MTU = 1350
 
 [Peer]
 PublicKey = $PEER_PUBKEY
@@ -677,7 +692,7 @@ EOF
 PrivateKey = $PRIVKEY
 Address = $WG_LOCAL_TUNNEL_IP
 ListenPort = $WG_LISTEN_PORT
-MTU = 1380
+MTU = 1350
 
 [Peer]
 PublicKey = $PEER_PUBKEY
@@ -697,7 +712,7 @@ Description=udp2raw server (vatan tunnel)
 After=network.target
 
 [Service]
-ExecStart=$UDP2RAW_BIN -s -l0.0.0.0:${UDP2RAW_PORT} -r127.0.0.1:${WG_LISTEN_PORT} -k "$RAW_PASS" --raw-mode faketcp -a
+ExecStart=$UDP2RAW_BIN -s -l0.0.0.0:${UDP2RAW_PORT} -r127.0.0.1:${WG_LISTEN_PORT} -k "$RAW_PASS" --raw-mode faketcp --cipher-mode none --auth-mode none --sock-buf 4096 -a
 Restart=always
 RestartSec=3
 
@@ -712,7 +727,7 @@ Description=udp2raw client (vatan tunnel)
 After=network.target
 
 [Service]
-ExecStart=$UDP2RAW_BIN -c -l127.0.0.1:${WG_UDP2RAW_LOCAL_PORT} -r${IP_FOREIGN}:${UDP2RAW_PORT} -k "$RAW_PASS" --raw-mode faketcp -a
+ExecStart=$UDP2RAW_BIN -c -l127.0.0.1:${WG_UDP2RAW_LOCAL_PORT} -r${IP_FOREIGN}:${UDP2RAW_PORT} -k "$RAW_PASS" --raw-mode faketcp --cipher-mode none --auth-mode none --sock-buf 4096 -a
 Restart=always
 RestartSec=3
 
