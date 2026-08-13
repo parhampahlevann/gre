@@ -603,16 +603,22 @@ if [[ "$MAIN_CHOICE" == "2" ]]; then
         ROLE="server"   # FOREIGN side is the udp2raw server (public exposed port)
     fi
 
-    # Default fixed keypair so both servers auto-match without manual copy/paste.
-    # WARNING: this pair is embedded in the script itself, so it is NOT secret if
-    # you share/publish this script. Anyone with a copy of the script can connect
+    # Default fixed keypairs so both servers auto-match without manual copy/paste.
+    # IMPORTANT: these must be TWO DIFFERENT identities (one per role) — using the
+    # SAME keypair on both ends makes WireGuard peer with itself, which breaks
+    # routing ("Required key not available", bogus sub-ms "pings" that never
+    # actually leave the box). Each role gets its own fixed keypair below.
+    # WARNING: these pairs are embedded in the script itself, so they are NOT
+    # secret if you share/publish this script — anyone with a copy can connect
     # to your tunnel. Fine for a private, non-distributed script; if you publish
-    # this on GitHub, choose option "2" below to generate a unique keypair instead.
-    DEFAULT_PRIVKEY="2KR+vNW1d2W1eFlyINNHlYr2XTLQKSsGiDsb4sFCuW0="
-    DEFAULT_PUBKEY="+8LcNGoDdjlxXQNuXR3CAmmozn3i/Z95W5p0YbANnWA="
+    # this on GitHub, choose option "2" below to generate unique keys instead.
+    IRAN_DEFAULT_PRIVKEY="CA8Pti8UCmYC3LmNANz/QwpXoF4uOOJNvbgW/Ci0wkk="
+    IRAN_DEFAULT_PUBKEY="SElEikHNWRlLX/uDX8cZC/qurO7zxv4Lb0vXjK4HTkI="
+    FOREIGN_DEFAULT_PRIVKEY="ANU54l5vsKYNWkQMkgx41DR4cFtcFdiH3YqEkWmypWI="
+    FOREIGN_DEFAULT_PUBKEY="/4Wl4ndBdIYCBrJ9OsBwahqHg7AwDndwLJuZZFy/X0I="
 
     echo "Key mode:"
-    echo "1 - Use built-in default matching keypair (no copy/paste needed, both servers auto-match)"
+    echo "1 - Use built-in default keypairs (no copy/paste needed, both servers auto-match)"
     echo "2 - Generate a unique random keypair for this install (more secure, requires manual exchange)"
     read -p "Select [1-2]: " KEY_MODE
 
@@ -628,12 +634,20 @@ if [[ "$MAIN_CHOICE" == "2" ]]; then
     else
         sudo mkdir -p /etc/wireguard
         umask 077
-        echo "$DEFAULT_PRIVKEY" | sudo tee /etc/wireguard/privatekey >/dev/null
-        echo "$DEFAULT_PUBKEY" | sudo tee /etc/wireguard/publickey >/dev/null
-        PRIVKEY="$DEFAULT_PRIVKEY"
-        PUBKEY="$DEFAULT_PUBKEY"
-        PEER_PUBKEY="$DEFAULT_PUBKEY"
-        echo -e "${CYAN}[i] Using built-in default keypair on both ends (no manual key exchange needed).${RESET}"
+        if [[ "$ROLE" == "client" ]]; then
+            # IRAN uses the IRAN identity, peers with the FOREIGN identity
+            PRIVKEY="$IRAN_DEFAULT_PRIVKEY"
+            PUBKEY="$IRAN_DEFAULT_PUBKEY"
+            PEER_PUBKEY="$FOREIGN_DEFAULT_PUBKEY"
+        else
+            # FOREIGN uses the FOREIGN identity, peers with the IRAN identity
+            PRIVKEY="$FOREIGN_DEFAULT_PRIVKEY"
+            PUBKEY="$FOREIGN_DEFAULT_PUBKEY"
+            PEER_PUBKEY="$IRAN_DEFAULT_PUBKEY"
+        fi
+        echo "$PRIVKEY" | sudo tee /etc/wireguard/privatekey >/dev/null
+        echo "$PUBKEY" | sudo tee /etc/wireguard/publickey >/dev/null
+        echo -e "${CYAN}[i] Using built-in default keypair for the ${ROLE} role (no manual key exchange needed).${RESET}"
     fi
 
     sudo mkdir -p /etc/wireguard
