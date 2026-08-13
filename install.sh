@@ -14,8 +14,6 @@ RESET=$(tput sgr0)
 GRE_NAME="vatan-m2"
 WG_IFACE="wg-vatan"
 WG_CONF="/etc/wireguard/${WG_IFACE}.conf"
-IPSEC_CONF="/etc/ipsec.conf"
-IPSEC_SECRETS="/etc/ipsec.secrets"
 UDP2RAW_BIN="/usr/local/bin/udp2raw"
 UDP2RAW_SERVICE="/etc/systemd/system/udp2raw-vatan.service"
 UDP2RAW_PORT=4096      # raw obfuscated port (TCP-looking)
@@ -25,6 +23,10 @@ PORT_STATE_DIR="/etc/vatan-tunnel"
 PORT_STATE_FILE="${PORT_STATE_DIR}/ports.conf"
 RESTORE_SCRIPT="/usr/local/bin/vatan-restore-ports.sh"
 RESTORE_SERVICE="/etc/systemd/system/vatan-restore-ports.service"
+
+GRE_CONF_FILE="${PORT_STATE_DIR}/gre.conf"
+GRE_RESTORE_SCRIPT="/usr/local/bin/vatan-restore-gre.sh"
+GRE_RESTORE_SERVICE="/etc/systemd/system/vatan-gre-tunnel.service"
 
 # ============================================================
 # ROBUST APT/DPKG INSTALL HELPER
@@ -85,18 +87,18 @@ safe_apt_install() {
 # ============================================================
 # SHARED FUNCTIONS (usable from any menu option)
 # ============================================================
-remove_gre_ipsec() {
-    echo -e "${YELLOW}[*] Removing GRE + IPsec...${RESET}"
+remove_gre_tunnel() {
+    echo -e "${YELLOW}[*] Removing GRE tunnel...${RESET}"
     sudo ip link set "$GRE_NAME" down 2>/dev/null || true
     sudo ip tunnel del "$GRE_NAME" 2>/dev/null || true
-    if command -v ipsec >/dev/null 2>&1; then
-        sudo ipsec down vatan-ipsec 2>/dev/null || true
-        sudo systemctl stop strongswan-starter 2>/dev/null || sudo systemctl stop strongswan 2>/dev/null || true
-        sudo systemctl disable strongswan-starter 2>/dev/null || sudo systemctl disable strongswan 2>/dev/null || true
-    fi
-    [[ -f "$IPSEC_CONF" ]] && sudo sed -i '/# >>> vatan-m2 tunnel/,/# <<< vatan-m2 tunnel/d' "$IPSEC_CONF"
-    [[ -f "$IPSEC_SECRETS" ]] && sudo sed -i '/# >>> vatan-m2 tunnel/,/# <<< vatan-m2 tunnel/d' "$IPSEC_SECRETS"
-    echo -e "${GREEN}[+] GRE + IPsec removed.${RESET}"
+    sudo iptables -t nat -D PREROUTING -p tcp --dport 22 -j DNAT --to-destination 132.168.30.2 2>/dev/null || true
+    sudo iptables -t nat -D PREROUTING -j DNAT --to-destination 132.168.30.1 2>/dev/null || true
+    sudo iptables -A INPUT --proto icmp -j DROP 2>/dev/null || true
+    sudo systemctl stop vatan-gre-tunnel 2>/dev/null || true
+    sudo systemctl disable vatan-gre-tunnel 2>/dev/null || true
+    sudo rm -f "$GRE_RESTORE_SERVICE" "$GRE_RESTORE_SCRIPT" "$GRE_CONF_FILE"
+    sudo systemctl daemon-reload 2>/dev/null || true
+    echo -e "${GREEN}[+] GRE tunnel removed.${RESET}"
 }
 
 remove_wg_udp2raw() {
@@ -220,8 +222,8 @@ echo "     Tunnel Manager (v2)"
 echo "===================================="
 echo -e "${RESET}"
 
-echo "1 - Install GRE + IPsec (AES-256-GCM) tunnel"
-echo "2 - Install WireGuard + udp2raw (obfuscated) tunnel"
+echo "1 - Install GRE tunnel (no encryption — fastest, lowest overhead)"
+echo "2 - Install WireGuard + udp2raw (obfuscated, encrypted) tunnel"
 echo "3 - Show tunnel status"
 echo "4 - Uninstall a tunnel (choose which)"
 echo "5 - Manage forwarded ports (add/remove/list)"
@@ -240,9 +242,9 @@ show_status() {
         echo "Not present."
     fi
 
-    echo -e "${CYAN}---- IPsec (strongSwan) ----${RESET}"
-    if command -v ipsec >/dev/null 2>&1; then
-        sudo ipsec statusall 2>/dev/null || echo "strongSwan installed but no active SA info."
+    echo -e "${CYAN}---- GRE boot-persistence service ----${RESET}"
+    if systemctl list-unit-files 2>/dev/null | grep -q vatan-gre-tunnel; then
+        sudo systemctl is-enabled vatan-gre-tunnel 2>/dev/null
     else
         echo "Not installed."
     fi
@@ -372,7 +374,11 @@ if [[ "$MAIN_CHOICE" == "5" ]]; then
         exit 0
     fi
 
-    read -p "Enter port(s), comma-separated (e.g. 443,8080,2053): " PORT_LIST
+    read -rp "Enter port(s), comma-separated (e.g. 443,8080,2053): " PORT_LIST
+    # strip anything that isn't a digit or comma (handles pasted invisible/
+    # non-UTF8 characters that break iptables' --dport parser)
+    PORT_LIST=$(printf '%s' "$PORT_LIST" | tr -cd '0-9,')
+
     echo "Protocol:"
     echo "1 - TCP only"
     echo "2 - UDP only"
@@ -393,8 +399,15 @@ if [[ "$MAIN_CHOICE" == "5" ]]; then
 
     IFS=',' read -ra PORTS_ARR <<< "$PORT_LIST"
     for p in "${PORTS_ARR[@]}"; do
-        p=$(echo "$p" | tr -d '[:space:]')
-        [[ -z "$p" ]] && continue
+        # keep digits only, then validate it's a real port number (1-65535)
+        p=$(printf '%s' "$p" | tr -cd '0-9')
+        if [[ -z "$p" ]]; then
+            continue
+        fi
+        if ! [[ "$p" =~ ^[0-9]+$ ]] || (( p < 1 || p > 65535 )); then
+            echo -e "${RED}[!] Skipping invalid port: '$p' (must be a number 1-65535)${RESET}"
+            continue
+        fi
         for proto in "${PROTOS[@]}"; do
             if [[ "$PF_ACTION" == "1" ]]; then
                 add_port_rule "$proto" "$p"
@@ -416,15 +429,15 @@ fi
 # ============================================================
 if [[ "$MAIN_CHOICE" == "4" ]]; then
     echo "Which tunnel do you want to remove?"
-    echo "1 - GRE + IPsec"
+    echo "1 - GRE"
     echo "2 - WireGuard + udp2raw"
     echo "3 - Both (but keep port-forward rules)"
     read -p "Select: " UN_CHOICE
 
     case "$UN_CHOICE" in
-        1) remove_gre_ipsec ;;
+        1) remove_gre_tunnel ;;
         2) remove_wg_udp2raw ;;
-        3) remove_gre_ipsec; remove_wg_udp2raw ;;
+        3) remove_gre_tunnel; remove_wg_udp2raw ;;
         *) echo -e "${RED}[!] Invalid selection.${RESET}"; exit 1 ;;
     esac
     echo -e "${YELLOW}[i] Port-forward rules (if any) were left in place. Use option 5 or 6 to clean those up too.${RESET}"
@@ -436,7 +449,7 @@ fi
 # ============================================================
 if [[ "$MAIN_CHOICE" == "6" ]]; then
     echo -e "${YELLOW}[*] Removing GRE tunnel, WireGuard tunnel, and all port forwards...${RESET}"
-    remove_gre_ipsec
+    remove_gre_tunnel
     remove_wg_udp2raw
     remove_all_port_forwards
     echo -e "${GREEN}[+] Everything has been removed. The server is back to a clean state.${RESET}"
@@ -456,52 +469,67 @@ read -p "Enter IRAN server IP: " IP_IRAN
 read -p "Enter FOREIGN server IP: " IP_FOREIGN
 
 # ============================================================
-# OPTION 1: GRE + IPsec
+# OPTION 1: GRE tunnel (no built-in encryption — fastest, lowest overhead)
 # ============================================================
 if [[ "$MAIN_CHOICE" == "1" ]]; then
 
-    read -s -p "Enter a shared PSK secret (same on both servers): " PSK
-    echo ""
-    [[ -z "$PSK" ]] && { echo -e "${RED}[!] PSK cannot be empty.${RESET}"; exit 1; }
-
-    echo -e "${YELLOW}[*] Installing strongSwan if not present...${RESET}"
-    if ! command -v ipsec >/dev/null 2>&1; then
-        safe_apt_install strongswan strongswan-pki libcharon-extra-plugins
-    fi
-
-    configure_ipsec() {
-        local LOCAL_IP=$1
-        local REMOTE_IP=$2
-        sudo bash -c "cat >> $IPSEC_CONF" <<EOF
-
-# >>> vatan-m2 tunnel
-conn vatan-ipsec
-    authby=secret
-    left=$LOCAL_IP
-    right=$REMOTE_IP
-    leftprotoport=gre
-    rightprotoport=gre
-    type=transport
-    ike=aes256gcm16-prfsha384-ecp384!
-    esp=aes256gcm16-ecp384!
-    keyexchange=ikev2
-    auto=start
-    dpdaction=restart
-    dpddelay=15s
-    dpdtimeout=45s
-# <<< vatan-m2 tunnel
+    sudo mkdir -p "$PORT_STATE_DIR"
+    sudo bash -c "cat > $GRE_CONF_FILE" <<EOF
+LOCATION=$LOCATION
+IP_IRAN=$IP_IRAN
+IP_FOREIGN=$IP_FOREIGN
 EOF
-        sudo bash -c "cat >> $IPSEC_SECRETS" <<EOF
-# >>> vatan-m2 tunnel
-$LOCAL_IP $REMOTE_IP : PSK "$PSK"
-# <<< vatan-m2 tunnel
+
+    install_gre_restore_service() {
+        sudo bash -c "cat > $GRE_RESTORE_SCRIPT" <<'GREEOF'
+#!/bin/bash
+GRE_NAME="vatan-m2"
+GRE_CONF_FILE="/etc/vatan-tunnel/gre.conf"
+[[ -f "$GRE_CONF_FILE" ]] || exit 0
+source "$GRE_CONF_FILE"
+
+# don't recreate if it's already up (e.g. re-run of the unit)
+ip link show "$GRE_NAME" >/dev/null 2>&1 && exit 0
+
+sysctl -w net.ipv4.ip_forward=1 >/dev/null
+
+if [[ "$LOCATION" == "1" ]]; then
+    ip tunnel add "$GRE_NAME" mode gre local "$IP_IRAN" remote "$IP_FOREIGN" ttl 255
+    ip link set "$GRE_NAME" up
+    ip addr add 132.168.30.2/30 dev "$GRE_NAME"
+    ip link set dev "$GRE_NAME" mtu 1476
+    iptables -t nat -C PREROUTING -p tcp --dport 22 -j DNAT --to-destination 132.168.30.2 2>/dev/null || \
+        iptables -t nat -A PREROUTING -p tcp --dport 22 -j DNAT --to-destination 132.168.30.2
+    iptables -t nat -C PREROUTING -j DNAT --to-destination 132.168.30.1 2>/dev/null || \
+        iptables -t nat -A PREROUTING -j DNAT --to-destination 132.168.30.1
+    iptables -t nat -C POSTROUTING -j MASQUERADE 2>/dev/null || \
+        iptables -t nat -A POSTROUTING -j MASQUERADE
+else
+    ip tunnel add "$GRE_NAME" mode gre local "$IP_FOREIGN" remote "$IP_IRAN" ttl 255
+    ip link set "$GRE_NAME" up
+    ip addr add 132.168.30.1/30 dev "$GRE_NAME"
+    ip link set dev "$GRE_NAME" mtu 1476
+    iptables -C INPUT --proto icmp -j DROP 2>/dev/null || iptables -A INPUT --proto icmp -j DROP
+fi
+GREEOF
+        sudo chmod +x "$GRE_RESTORE_SCRIPT"
+
+        sudo bash -c "cat > $GRE_RESTORE_SERVICE" <<EOF
+[Unit]
+Description=Vatan GRE tunnel restore
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=$GRE_RESTORE_SCRIPT
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
 EOF
-        sudo systemctl enable strongswan-starter 2>/dev/null || sudo systemctl enable strongswan 2>/dev/null || true
-        sudo systemctl restart strongswan-starter 2>/dev/null || sudo systemctl restart strongswan 2>/dev/null || true
-        sleep 2
-        sudo ipsec restart 2>/dev/null || true
-        sleep 2
-        sudo ipsec up vatan-ipsec 2>/dev/null || true
+        sudo systemctl daemon-reload
+        sudo systemctl enable vatan-gre-tunnel >/dev/null 2>&1 || true
     }
 
     if [[ "$LOCATION" == "1" ]]; then
@@ -509,8 +537,7 @@ EOF
         sudo ip tunnel add "$GRE_NAME" mode gre local "$IP_IRAN" remote "$IP_FOREIGN" ttl 255
         sudo ip link set "$GRE_NAME" up
         sudo ip addr add 132.168.30.2/30 dev "$GRE_NAME"
-        sudo ip link set dev "$GRE_NAME" mtu 1400
-        configure_ipsec "$IP_IRAN" "$IP_FOREIGN"
+        sudo ip link set dev "$GRE_NAME" mtu 1476
         sudo sysctl -w net.ipv4.ip_forward=1
         sudo iptables -t nat -A PREROUTING -p tcp --dport 22 -j DNAT --to-destination 132.168.30.2
         sudo iptables -t nat -A PREROUTING -j DNAT --to-destination 132.168.30.1
@@ -521,15 +548,18 @@ EOF
         sudo ip tunnel add "$GRE_NAME" mode gre local "$IP_FOREIGN" remote "$IP_IRAN" ttl 255
         sudo ip link set "$GRE_NAME" up
         sudo ip addr add 132.168.30.1/30 dev "$GRE_NAME"
-        sudo ip link set dev "$GRE_NAME" mtu 1400
-        configure_ipsec "$IP_FOREIGN" "$IP_IRAN"
+        sudo ip link set dev "$GRE_NAME" mtu 1476
         sudo iptables -A INPUT --proto icmp -j DROP
     else
         echo -e "${RED}[!] Invalid selection.${RESET}"
         exit 1
     fi
 
-    echo -e "${GREEN}[+] Done. Check status with option 3 or: sudo ipsec statusall${RESET}"
+    install_gre_restore_service
+
+    echo -e "${GREEN}[+] Done. GRE tunnel is up (no encryption — max speed) and will auto-restore on reboot.${RESET}"
+    echo -e "${CYAN}[i] Check status with option 3.${RESET}"
+    echo -e "${YELLOW}[i] Note: this tunnel is unencrypted. Traffic pattern/metadata is visible on the wire (content is plaintext). If you need encryption without the earlier IPsec slowdown, use option 2 (WireGuard) — it's lighter than AES-GCM/IPsec in software and still obfuscated via udp2raw.${RESET}"
 fi
 
 # ============================================================
