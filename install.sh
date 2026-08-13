@@ -27,6 +27,62 @@ RESTORE_SCRIPT="/usr/local/bin/vatan-restore-ports.sh"
 RESTORE_SERVICE="/etc/systemd/system/vatan-restore-ports.service"
 
 # ============================================================
+# ROBUST APT/DPKG INSTALL HELPER
+# Fixes the common "Sub-process /usr/bin/dpkg returned an error
+# code" failure automatically, then retries the install.
+# ============================================================
+safe_apt_install() {
+    local packages=("$@")
+
+    # 1) Wait for any other apt/dpkg process to release its lock
+    local waited=0
+    while sudo fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 || \
+          sudo fuser /var/lib/dpkg/lock >/dev/null 2>&1 || \
+          sudo fuser /var/lib/apt/lists/lock >/dev/null 2>&1; do
+        if [[ $waited -ge 60 ]]; then
+            echo -e "${YELLOW}[!] apt/dpkg lock has been held for 60s, forcing removal of stale lock files...${RESET}"
+            sudo rm -f /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/lib/apt/lists/lock /var/cache/apt/archives/lock
+            break
+        fi
+        echo -e "${YELLOW}[*] Waiting for another apt/dpkg process to finish...${RESET}"
+        sleep 5
+        waited=$((waited + 5))
+    done
+
+    # 2) Repair any half-configured packages from a previous failed run
+    sudo dpkg --configure -a >/dev/null 2>&1 || true
+    sudo apt-get install -f -y >/dev/null 2>&1 || true
+
+    # 3) Refresh package lists
+    sudo apt-get update -y
+
+    # 4) Try the actual install
+    if sudo apt-get install -y "${packages[@]}"; then
+        return 0
+    fi
+
+    # 5) First attempt failed -> run the standard recovery sequence, then retry once
+    echo -e "${YELLOW}[!] Install failed, attempting automatic repair (dpkg --configure -a / apt --fix-broken install)...${RESET}"
+    sudo dpkg --configure -a || true
+    sudo apt-get install -f -y || true
+    sudo apt-get clean
+    sudo apt-get update -y
+
+    if sudo apt-get install -y "${packages[@]}"; then
+        echo -e "${GREEN}[+] Install succeeded after repair.${RESET}"
+        return 0
+    fi
+
+    # 6) Still broken -> show real dpkg log so the user can see the actual root cause
+    echo -e "${RED}[!] Package install still failing after automatic repair.${RESET}"
+    echo -e "${YELLOW}---- Last dpkg log entries (real error is usually here) ----${RESET}"
+    sudo tail -n 40 /var/log/dpkg.log 2>/dev/null
+    echo -e "${YELLOW}---- Disk space ----${RESET}"
+    df -h /
+    return 1
+}
+
+# ============================================================
 # SHARED FUNCTIONS (usable from any menu option)
 # ============================================================
 remove_gre_ipsec() {
@@ -410,8 +466,7 @@ if [[ "$MAIN_CHOICE" == "1" ]]; then
 
     echo -e "${YELLOW}[*] Installing strongSwan if not present...${RESET}"
     if ! command -v ipsec >/dev/null 2>&1; then
-        sudo apt-get update -y
-        sudo apt-get install -y strongswan strongswan-pki libcharon-extra-plugins
+        safe_apt_install strongswan strongswan-pki libcharon-extra-plugins
     fi
 
     configure_ipsec() {
@@ -484,8 +539,7 @@ if [[ "$MAIN_CHOICE" == "2" ]]; then
 
     echo -e "${YELLOW}[*] Installing WireGuard tools if not present...${RESET}"
     if ! command -v wg >/dev/null 2>&1; then
-        sudo apt-get update -y
-        sudo apt-get install -y wireguard wireguard-tools
+        safe_apt_install wireguard wireguard-tools
     fi
 
     if ! command -v "$UDP2RAW_BIN" >/dev/null 2>&1 && [[ ! -f "$UDP2RAW_BIN" ]]; then
